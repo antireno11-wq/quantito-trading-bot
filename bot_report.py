@@ -11,7 +11,6 @@ from alpaca.trading.requests import (
     MarketOrderRequest,
     GetOrdersRequest,
     StopOrderRequest,
-    CancelOrderRequest,
 )
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderStatus
 
@@ -22,7 +21,6 @@ from alpaca.data.timeframe import TimeFrame
 
 TZ_ET = ZoneInfo("America/New_York")
 
-# ===== ENV =====
 ALPACA_KEY = os.environ["ALPACA_KEY"]
 ALPACA_SECRET = os.environ["ALPACA_SECRET"]
 ALPACA_BASE_URL = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
@@ -30,10 +28,9 @@ ALPACA_BASE_URL = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.ma
 TG_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TG_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-# ===== SETTINGS =====
-INVEST_FRACTION = float(os.environ.get("INVEST_FRACTION", "0.80"))  # 80% del cash
-STOP_PCT = float(os.environ.get("STOP_PCT", "0.04"))                # stop inicial -4%
-MIN_PRICE = float(os.environ.get("MIN_PRICE", "5"))                 # evitar muy baratas
+INVEST_FRACTION = float(os.environ.get("INVEST_FRACTION", "0.80"))
+STOP_PCT = float(os.environ.get("STOP_PCT", "0.04"))
+MIN_PRICE = float(os.environ.get("MIN_PRICE", "5"))
 
 LOOKBACK_DAYS = int(os.environ.get("LOOKBACK_DAYS", "120"))
 BREAKOUT_LOOKBACK = int(os.environ.get("BREAKOUT_LOOKBACK", "20"))
@@ -41,16 +38,13 @@ RSI_PERIOD = int(os.environ.get("RSI_PERIOD", "14"))
 RSI_MIN = float(os.environ.get("RSI_MIN", "55"))
 
 MARKET_FILTER_SYMBOL = os.environ.get("MARKET_FILTER_SYMBOL", "QQQ")
-MARKET_FILTER_MA = int(os.environ.get("MARKET_FILTER_MA", "20"))    # tú lo dejaste en 20
+MARKET_FILTER_MA = int(os.environ.get("MARKET_FILTER_MA", "20"))
 
-SIMULATED_CAPITAL = os.environ.get("SIMULATED_CAPITAL")             # ej: "200"
+SIMULATED_CAPITAL = os.environ.get("SIMULATED_CAPITAL")
 
-# Trailing behavior:
-# - se activa cuando la posición va >= +8%
-# - luego el stop sube a: max(stop_actual, close*(1-5%), entry*(1+2%))
-TRAIL_ARM_PCT = float(os.environ.get("TRAIL_ARM_PCT", "0.08"))      # +8% activa trailing
-TRAIL_PCT = float(os.environ.get("TRAIL_PCT", "0.05"))              # trailing 5% desde close
-LOCK_PROFIT_PCT = float(os.environ.get("LOCK_PROFIT_PCT", "0.02"))  # asegura +2% mínimo al activar trailing
+TRAIL_ARM_PCT = float(os.environ.get("TRAIL_ARM_PCT", "0.08"))
+TRAIL_PCT = float(os.environ.get("TRAIL_PCT", "0.05"))
+LOCK_PROFIT_PCT = float(os.environ.get("LOCK_PROFIT_PCT", "0.02"))
 
 PAPER = ("paper" in ALPACA_BASE_URL)
 
@@ -103,7 +97,6 @@ def today_range_et():
 
 
 def get_daily_bars(symbols: list[str], start: dt.datetime, end: dt.datetime) -> pd.DataFrame:
-    # IMPORTANT: feed="iex" evita el error SIP
     req = StockBarsRequest(
         symbol_or_symbols=symbols,
         timeframe=TimeFrame.Day,
@@ -125,7 +118,6 @@ def round2(x: float) -> float:
 
 
 def list_open_orders():
-    # open orders (not all statuses)
     req = GetOrdersRequest(status=OrderStatus.OPEN, limit=200)
     return trading.get_orders(req)
 
@@ -133,7 +125,6 @@ def list_open_orders():
 def cancel_open_stop_orders_for_symbol(symbol: str):
     orders = list_open_orders()
     for o in orders:
-        # stop orders for same symbol and SELL side
         try:
             if o.symbol == symbol and str(o.side).lower().endswith("sell") and str(o.order_type).lower().endswith("stop"):
                 trading.cancel_order_by_id(o.id)
@@ -168,7 +159,6 @@ def place_stop(symbol: str, qty: float, stop_price: float):
 def main():
     start_day, end_day, now_et = today_range_et()
 
-    # ---- Account (real o simulada) ----
     acct = trading.get_account()
     if SIMULATED_CAPITAL:
         equity = float(SIMULATED_CAPITAL)
@@ -182,7 +172,6 @@ def main():
     day_pnl = equity - last_equity
     day_pnl_pct = (day_pnl / last_equity * 100.0) if last_equity else 0.0
 
-    # ---- Universe + data ----
     universe = load_universe()
     start = (now_et - dt.timedelta(days=LOOKBACK_DAYS + 10)).replace(hour=0, minute=0, second=0, microsecond=0)
 
@@ -225,7 +214,6 @@ def main():
             "ret20_pct": ret20,
         }
 
-    # ---- Market filter ----
     mkt = build_indicators(MARKET_FILTER_SYMBOL)
     if not mkt:
         telegram_send("⚠️ Quantito: no pude calcular filtro de mercado (datos insuficientes).")
@@ -240,11 +228,9 @@ def main():
 
     market_ok = (mkt["close"] > mkt_ma)
 
-    # ---- Current positions ----
     positions = trading.get_all_positions()
     held_symbol = positions[0].symbol if positions else None
 
-    # ---- Scan candidates ----
     candidates = []
     for sym in universe:
         if sym == MARKET_FILTER_SYMBOL:
@@ -254,41 +240,30 @@ def main():
             continue
         if ind["close"] < MIN_PRICE:
             continue
-
-        signal = (
-            ind["close"] > ind["max_prev_n"] and
-            ind["close"] > ind["ma20"] and
-            ind["rsi"] >= RSI_MIN
-        )
+        signal = (ind["close"] > ind["max_prev_n"] and ind["close"] > ind["ma20"] and ind["rsi"] >= RSI_MIN)
         if signal:
             candidates.append(ind)
 
     candidates.sort(key=lambda x: (x["ret20_pct"] if not math.isnan(x["ret20_pct"]) else -9999), reverse=True)
 
-    top_lines = []
-    for ind in candidates[:3]:
-        top_lines.append(
-            f"- {ind['symbol']}: close {ind['close']:.2f} | MA20 {ind['ma20']:.2f} | RSI {ind['rsi']:.1f} | ret20 {ind['ret20_pct']:.1f}%"
-        )
-    if not top_lines:
-        top_lines = ["- (sin señales hoy)"]
+    top_lines = [
+        f"- {i['symbol']}: close {i['close']:.2f} | MA20 {i['ma20']:.2f} | RSI {i['rsi']:.1f} | ret20 {i['ret20_pct']:.1f}%"
+        for i in candidates[:3]
+    ] or ["- (sin señales hoy)"]
 
     action_lines = []
     trailing_lines = []
 
-    # ---- Exit / trailing management ----
     if held_symbol:
         pos = positions[0]
         qty = safe_float(pos.qty)
         avg_entry = safe_float(pos.avg_entry_price)
-        # last close from indicators
         held_ind = build_indicators(held_symbol)
 
         if held_ind:
             close = float(held_ind["close"])
             pnl_pct = (close / avg_entry - 1.0) if avg_entry else 0.0
 
-            # If market filter OFF or close < MA20 -> exit market (and cancel stop)
             if (not market_ok) or (close < held_ind["ma20"]):
                 reason = "mercado OFF" if not market_ok else "close < MA20"
                 try:
@@ -297,12 +272,7 @@ def main():
                     pass
 
                 if qty > 0:
-                    sell = MarketOrderRequest(
-                        symbol=held_symbol,
-                        qty=qty,
-                        side=OrderSide.SELL,
-                        time_in_force=TimeInForce.DAY,
-                    )
+                    sell = MarketOrderRequest(symbol=held_symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.DAY)
                     trading.submit_order(sell)
                     action_lines.append(f"✅ SELL {held_symbol} qty {qty:g} (salida: {reason})")
                 else:
@@ -310,29 +280,23 @@ def main():
             else:
                 action_lines.append(f"ℹ️ Mantengo {held_symbol} (pnl≈{pnl_pct*100:.1f}%, market_ok={market_ok}).")
 
-                # Trailing: only if pnl >= +8%
                 if pnl_pct >= TRAIL_ARM_PCT and qty > 0:
                     existing_stop = get_existing_stop_price(held_symbol)
-                    # new proposed trailing stop
                     trail_stop = close * (1 - TRAIL_PCT)
                     lock_stop = avg_entry * (1 + LOCK_PROFIT_PCT)
                     new_stop = max(trail_stop, lock_stop, existing_stop or 0.0)
 
-                    # if we don't have stop or stop increases meaningfully -> replace
                     if (existing_stop is None) or (new_stop > existing_stop + 0.01):
                         cancel_open_stop_orders_for_symbol(held_symbol)
                         place_stop(held_symbol, qty, new_stop)
                         trailing_lines.append(
-                            f"🟣 Trailing ON: pnl≈{pnl_pct*100:.1f}% | stop→ {new_stop:.2f} (trail {TRAIL_PCT*100:.1f}% / lock {LOCK_PROFIT_PCT*100:.1f}%)"
+                            f"Trailing ON: pnl≈{pnl_pct*100:.1f}% | stop→ {new_stop:.2f} (trail {TRAIL_PCT*100:.1f}% / lock {LOCK_PROFIT_PCT*100:.1f}%)"
                         )
                     else:
-                        trailing_lines.append(
-                            f"🟣 Trailing ON: stop actual {existing_stop:.2f} (pnl≈{pnl_pct*100:.1f}%)"
-                        )
+                        trailing_lines.append(f"Trailing ON: stop actual {existing_stop:.2f} (pnl≈{pnl_pct*100:.1f}%)")
         else:
             action_lines.append(f"ℹ️ Mantengo {held_symbol} (sin indicadores hoy).")
 
-    # ---- Entry logic (solo si no hay posición) ----
     if not held_symbol:
         if not market_ok:
             action_lines.append(f"⛔ No compro: filtro mercado OFF ({MARKET_FILTER_SYMBOL} < {ma_label}).")
@@ -340,15 +304,14 @@ def main():
             if candidates:
                 pick = candidates[0]
                 symbol = pick["symbol"]
-
                 notional = max(0.0, cash * INVEST_FRACTION)
+
                 if notional < 5:
                     action_lines.append("⛔ Cash muy bajo para comprar.")
                 else:
                     entry_ref = float(pick["close"])
                     initial_stop = round2(entry_ref * (1 - STOP_PCT))
 
-                    # OTO: compra market + stop loss (sin take profit)
                     buy = MarketOrderRequest(
                         symbol=symbol,
                         notional=round2(notional),
@@ -359,12 +322,11 @@ def main():
                     )
                     trading.submit_order(buy)
                     action_lines.append(
-                        f"✅ BUY {symbol} notional {fmt_money(notional)} | SL inicial {initial_stop} | trailing se activa en +{TRAIL_ARM_PCT*100:.0f}%"
+                        f"✅ BUY {symbol} notional {fmt_money(notional)} | SL inicial {initial_stop} | trailing en +{TRAIL_ARM_PCT*100:.0f}%"
                     )
             else:
                 action_lines.append("ℹ️ Mercado OK, pero no hay señales de compra hoy.")
 
-    # ---- Orders today ----
     try:
         req = GetOrdersRequest(status=OrderStatus.ALL, after=start_day, until=end_day, limit=50)
         orders = trading.get_orders(req)
@@ -377,7 +339,6 @@ def main():
     except Exception:
         order_lines = ["- (no pude listar órdenes hoy)"]
 
-    # ---- Report ----
     stamp = f"{now_et:%Y-%m-%d %H:%M} ET"
     report = []
     report.append(f"📌 Quantito Daily ({stamp})")
