@@ -31,15 +31,16 @@ STOP_PCT = float(os.environ.get("STOP_PCT", "0.04"))                # -4%
 TAKE_PCT = float(os.environ.get("TAKE_PCT", "0.08"))                # +8%
 MIN_PRICE = float(os.environ.get("MIN_PRICE", "5"))                 # evitar muy baratas
 
-LOOKBACK_DAYS = int(os.environ.get("LOOKBACK_DAYS", "120"))         # datos para MA50
+LOOKBACK_DAYS = int(os.environ.get("LOOKBACK_DAYS", "120"))         # datos para MA
 BREAKOUT_LOOKBACK = int(os.environ.get("BREAKOUT_LOOKBACK", "20"))  # máximo 20 días
 RSI_PERIOD = int(os.environ.get("RSI_PERIOD", "14"))
 RSI_MIN = float(os.environ.get("RSI_MIN", "55"))
 
 MARKET_FILTER_SYMBOL = os.environ.get("MARKET_FILTER_SYMBOL", "QQQ")
-MARKET_FILTER_MA = int(os.environ.get("MARKET_FILTER_MA", "50"))
+MARKET_FILTER_MA = int(os.environ.get("MARKET_FILTER_MA", "20"))  # tú lo dejaste en 20
 
-# Con tu setup: 1 posición máxima por diseño (no abrimos si ya hay una)
+SIMULATED_CAPITAL = os.environ.get("SIMULATED_CAPITAL")  # ej: "200"
+
 PAPER = ("paper" in ALPACA_BASE_URL)
 
 trading = TradingClient(ALPACA_KEY, ALPACA_SECRET, paper=PAPER)
@@ -56,6 +57,7 @@ def load_universe() -> list[str]:
     with open("universe.txt", "r", encoding="utf-8") as f:
         tickers = [x.strip().upper() for x in f.readlines()]
     tickers = [t for t in tickers if t and not t.startswith("#")]
+    # Asegura que el símbolo de filtro esté disponible para indicadores
     if MARKET_FILTER_SYMBOL not in tickers:
         tickers.append(MARKET_FILTER_SYMBOL)
     return tickers
@@ -64,7 +66,7 @@ def load_universe() -> list[str]:
 def rsi(close: pd.Series, period: int = 14) -> pd.Series:
     delta = close.diff()
     gain = delta.clip(lower=0)
-    loss = (-delta).clip(lower=0)
+    loss = (-delta.clip(upper=0))
     avg_gain = gain.ewm(alpha=1/period, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1/period, adjust=False).mean()
     rs = avg_gain / avg_loss.replace(0, pd.NA)
@@ -91,7 +93,7 @@ def today_range_et():
 
 
 def get_daily_bars(symbols: list[str], start: dt.datetime, end: dt.datetime) -> pd.DataFrame:
-    # IMPORTANT: feed="iex" para evitar SIP error
+    # IMPORTANT: feed="iex" evita el error SIP
     req = StockBarsRequest(
         symbol_or_symbols=symbols,
         timeframe=TimeFrame.Day,
@@ -111,11 +113,17 @@ def get_daily_bars(symbols: list[str], start: dt.datetime, end: dt.datetime) -> 
 def main():
     start_day, end_day, now_et = today_range_et()
 
-    # ---- Account ----
+    # ---- Account (real o simulada) ----
     acct = trading.get_account()
-    equity = safe_float(acct.equity)
-    cash = safe_float(acct.cash)
-    last_equity = safe_float(getattr(acct, "last_equity", equity))
+    if SIMULATED_CAPITAL:
+        equity = float(SIMULATED_CAPITAL)
+        cash = float(SIMULATED_CAPITAL)
+        last_equity = equity
+    else:
+        equity = safe_float(acct.equity)
+        cash = safe_float(acct.cash)
+        last_equity = safe_float(getattr(acct, "last_equity", equity))
+
     day_pnl = equity - last_equity
     day_pnl_pct = (day_pnl / last_equity * 100.0) if last_equity else 0.0
 
@@ -132,11 +140,11 @@ def main():
 
     def build_indicators(sym: str) -> dict | None:
         df = bars[bars["symbol"] == sym].sort_values("timestamp")
-        if df.empty or len(df) < max(MARKET_FILTER_MA, BREAKOUT_LOOKBACK, RSI_PERIOD) + 5:
+        need = max(MARKET_FILTER_MA, BREAKOUT_LOOKBACK, RSI_PERIOD, 50) + 5
+        if df.empty or len(df) < need:
             return None
 
         close = df["close"].astype(float).reset_index(drop=True)
-
         ma20 = close.rolling(20).mean()
         ma50 = close.rolling(50).mean()
         rsi_s = rsi(close, RSI_PERIOD)
@@ -169,9 +177,17 @@ def main():
         telegram_send("⚠️ Quantito: no pude calcular filtro de mercado (datos insuficientes).")
         return
 
-    market_ok = (mkt["close"] > mkt["ma50"])
+    # MA dinámica para el filtro: MA20 o MA50 (usamos lo que corresponda)
+    if MARKET_FILTER_MA <= 20:
+        mkt_ma = mkt["ma20"]
+        ma_label = "MA20"
+    else:
+        mkt_ma = mkt["ma50"]
+        ma_label = "MA50"
 
-    # ---- Positions ----
+    market_ok = (mkt["close"] > mkt_ma)
+
+    # ---- Positions (en paper real puede haber posiciones, aunque simules capital) ----
     positions = trading.get_all_positions()
     held_symbol = positions[0].symbol if positions else None
 
@@ -214,7 +230,7 @@ def main():
             if held_ind["close"] < held_ind["ma20"]:
                 exit_reason = "salida: close < MA20"
             elif not market_ok:
-                exit_reason = "salida: mercado (QQQ) bajo MA50"
+                exit_reason = f"salida: mercado OFF ({MARKET_FILTER_SYMBOL} < {ma_label})"
 
         if exit_reason:
             qty = safe_float(positions[0].qty)
@@ -235,7 +251,7 @@ def main():
     # ---- Entry logic (solo si no hay posición) ----
     if not held_symbol:
         if not market_ok:
-            action_lines.append("⛔ No compro: filtro mercado OFF (QQQ < MA50).")
+            action_lines.append(f"⛔ No compro: filtro mercado OFF ({MARKET_FILTER_SYMBOL} < {ma_label}).")
         else:
             if candidates:
                 pick = candidates[0]
@@ -276,6 +292,7 @@ def main():
         if not order_lines:
             order_lines = ["- (sin órdenes hoy)"]
     except Exception:
+        # No lo tratamos como fatal: solo lo reportamos
         order_lines = ["- (no pude listar órdenes hoy)"]
 
     # ---- Report ----
@@ -284,12 +301,12 @@ def main():
     report.append(f"📌 Quantito Daily ({stamp})")
     report.append("")
     report.append("🧭 Filtro mercado")
-    report.append(f"- {MARKET_FILTER_SYMBOL}: close {mkt['close']:.2f} | MA{MARKET_FILTER_MA} {mkt['ma50']:.2f}")
+    report.append(f"- {MARKET_FILTER_SYMBOL}: close {mkt['close']:.2f} | {ma_label} {mkt_ma:.2f}")
     report.append(f"- market_ok: {market_ok}")
     report.append("")
     report.append("💼 Cuenta")
-    report.append(f"- Equity: ${equity:,.2f}")
-    report.append(f"- Cash: ${cash:,.2f}")
+    report.append(f"- Equity: ${equity:,.2f}" + (" (sim)" if SIMULATED_CAPITAL else ""))
+    report.append(f"- Cash: ${cash:,.2f}" + (" (sim)" if SIMULATED_CAPITAL else ""))
     report.append(f"- PnL día: {fmt_money(day_pnl)} ({day_pnl_pct:+.2f}%)")
     report.append("")
     report.append("📈 Señales (top)")
