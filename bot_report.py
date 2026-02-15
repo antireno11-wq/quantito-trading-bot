@@ -7,15 +7,9 @@ import pandas as pd
 import requests
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import (
-    MarketOrderRequest,
-    GetOrdersRequest,
-)
-from alpaca.trading.enums import (
-    OrderSide,
-    TimeInForce,
-    OrderStatus,
-)
+from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderStatus
+
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
@@ -31,19 +25,21 @@ ALPACA_BASE_URL = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.ma
 TG_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TG_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-# ===== SETTINGS (ajustables por variables de entorno) =====
+# ===== SETTINGS =====
 INVEST_FRACTION = float(os.environ.get("INVEST_FRACTION", "0.80"))  # 80% del cash
-STOP_PCT = float(os.environ.get("STOP_PCT", "0.04"))               # -4%
-TAKE_PCT = float(os.environ.get("TAKE_PCT", "0.08"))               # +8%
-MIN_PRICE = float(os.environ.get("MIN_PRICE", "5"))                # evitar cosas muy baratas
-LOOKBACK_DAYS = int(os.environ.get("LOOKBACK_DAYS", "120"))         # para MA50 y señales
+STOP_PCT = float(os.environ.get("STOP_PCT", "0.04"))                # -4%
+TAKE_PCT = float(os.environ.get("TAKE_PCT", "0.08"))                # +8%
+MIN_PRICE = float(os.environ.get("MIN_PRICE", "5"))                 # evitar muy baratas
+
+LOOKBACK_DAYS = int(os.environ.get("LOOKBACK_DAYS", "120"))         # datos para MA50
 BREAKOUT_LOOKBACK = int(os.environ.get("BREAKOUT_LOOKBACK", "20"))  # máximo 20 días
 RSI_PERIOD = int(os.environ.get("RSI_PERIOD", "14"))
 RSI_MIN = float(os.environ.get("RSI_MIN", "55"))
 
-MARKET_FILTER_SYMBOL = os.environ.get("MARKET_FILTER_SYMBOL", "QQQ")  # filtro
+MARKET_FILTER_SYMBOL = os.environ.get("MARKET_FILTER_SYMBOL", "QQQ")
 MARKET_FILTER_MA = int(os.environ.get("MARKET_FILTER_MA", "50"))
 
+# Con tu setup: 1 posición máxima por diseño (no abrimos si ya hay una)
 PAPER = ("paper" in ALPACA_BASE_URL)
 
 trading = TradingClient(ALPACA_KEY, ALPACA_SECRET, paper=PAPER)
@@ -60,7 +56,6 @@ def load_universe() -> list[str]:
     with open("universe.txt", "r", encoding="utf-8") as f:
         tickers = [x.strip().upper() for x in f.readlines()]
     tickers = [t for t in tickers if t and not t.startswith("#")]
-    # Aseguramos que el filtro esté incluido aunque lo borres del archivo
     if MARKET_FILTER_SYMBOL not in tickers:
         tickers.append(MARKET_FILTER_SYMBOL)
     return tickers
@@ -76,30 +71,6 @@ def rsi(close: pd.Series, period: int = 14) -> pd.Series:
     return 100 - (100 / (1 + rs))
 
 
-def get_daily_bars(symbols: list[str], start: dt.datetime, end: dt.datetime) -> pd.DataFrame:
-    req = StockBarsRequest(
-        symbol_or_symbols=symbols,
-        timeframe=TimeFrame.Day,
-        start=start,
-        end=end,
-        adjustment="all",
-    )
-    bars = data.get_stock_bars(req).df
-    # df index: MultiIndex (symbol, timestamp)
-    if bars.empty:
-        return bars
-    bars = bars.reset_index()
-    bars["timestamp"] = pd.to_datetime(bars["timestamp"], utc=True).dt.tz_convert(TZ_ET)
-    return bars
-
-
-def today_range_et():
-    now = dt.datetime.now(TZ_ET)
-    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    end = start + dt.timedelta(days=1)
-    return start, end, now
-
-
 def safe_float(x, default=0.0):
     try:
         return float(x)
@@ -110,6 +81,31 @@ def safe_float(x, default=0.0):
 def fmt_money(x: float) -> str:
     sign = "+" if x >= 0 else ""
     return f"{sign}${x:,.2f}"
+
+
+def today_range_et():
+    now = dt.datetime.now(TZ_ET)
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    end = start + dt.timedelta(days=1)
+    return start, end, now
+
+
+def get_daily_bars(symbols: list[str], start: dt.datetime, end: dt.datetime) -> pd.DataFrame:
+    # IMPORTANT: feed="iex" para evitar SIP error
+    req = StockBarsRequest(
+        symbol_or_symbols=symbols,
+        timeframe=TimeFrame.Day,
+        start=start,
+        end=end,
+        adjustment="all",
+        feed="iex",
+    )
+    bars = data.get_stock_bars(req).df
+    if bars.empty:
+        return bars
+    bars = bars.reset_index()
+    bars["timestamp"] = pd.to_datetime(bars["timestamp"], utc=True).dt.tz_convert(TZ_ET)
+    return bars
 
 
 def main():
@@ -132,31 +128,29 @@ def main():
         bars = get_daily_bars(universe, start, end)
     except Exception as e:
         telegram_send(f"⚠️ Quantito: error bajando datos: {type(e).__name__}: {str(e)[:180]}")
-        raise
+        return
 
-    # Helper: build indicator table per symbol
     def build_indicators(sym: str) -> dict | None:
         df = bars[bars["symbol"] == sym].sort_values("timestamp")
         if df.empty or len(df) < max(MARKET_FILTER_MA, BREAKOUT_LOOKBACK, RSI_PERIOD) + 5:
             return None
 
         close = df["close"].astype(float).reset_index(drop=True)
+
         ma20 = close.rolling(20).mean()
         ma50 = close.rolling(50).mean()
-        rsi14 = rsi(close, RSI_PERIOD)
+        rsi_s = rsi(close, RSI_PERIOD)
 
         last_close = float(close.iloc[-1])
         last_ma20 = float(ma20.iloc[-1])
         last_ma50 = float(ma50.iloc[-1])
-        last_rsi = float(rsi14.iloc[-1])
+        last_rsi = float(rsi_s.iloc[-1])
 
-        # breakout: close > max prev N closes (excluding today)
         prev = close.iloc[:-1]
         if len(prev) < BREAKOUT_LOOKBACK:
             return None
         max_prev_n = float(prev.tail(BREAKOUT_LOOKBACK).max())
 
-        # simple momentum score: 20d return
         ret20 = float((close.iloc[-1] / close.iloc[-21] - 1.0) * 100.0) if len(close) > 21 else float("nan")
 
         return {
@@ -169,7 +163,7 @@ def main():
             "ret20_pct": ret20,
         }
 
-    # ---- Market filter (QQQ > MA50) ----
+    # ---- Market filter ----
     mkt = build_indicators(MARKET_FILTER_SYMBOL)
     if not mkt:
         telegram_send("⚠️ Quantito: no pude calcular filtro de mercado (datos insuficientes).")
@@ -177,15 +171,11 @@ def main():
 
     market_ok = (mkt["close"] > mkt["ma50"])
 
-    # ---- Current positions ----
+    # ---- Positions ----
     positions = trading.get_all_positions()
     held_symbol = positions[0].symbol if positions else None
 
-    # ---- Decide exits/entries ----
-    action_lines = []
-    top_lines = []
-
-    # candidate scan
+    # ---- Scan candidates ----
     candidates = []
     for sym in universe:
         if sym == MARKET_FILTER_SYMBOL:
@@ -204,10 +194,9 @@ def main():
         if signal:
             candidates.append(ind)
 
-    # sort by 20d return (best first)
     candidates.sort(key=lambda x: (x["ret20_pct"] if not math.isnan(x["ret20_pct"]) else -9999), reverse=True)
 
-    # build top3 display
+    top_lines = []
     for ind in candidates[:3]:
         top_lines.append(
             f"- {ind['symbol']}: close {ind['close']:.2f} | MA20 {ind['ma20']:.2f} | RSI {ind['rsi']:.1f} | ret20 {ind['ret20_pct']:.1f}%"
@@ -215,21 +204,19 @@ def main():
     if not top_lines:
         top_lines = ["- (sin señales hoy)"]
 
-    # Exit logic (si hay posición)
+    action_lines = []
+
+    # ---- Exit logic ----
     if held_symbol:
         held_ind = build_indicators(held_symbol)
         exit_reason = None
-        if not held_ind:
-            exit_reason = "no pude calcular indicadores, mantengo posición"
-        else:
-            # salida si pierde MA20 o si filtro mercado se pone malo
+        if held_ind:
             if held_ind["close"] < held_ind["ma20"]:
                 exit_reason = "salida: close < MA20"
             elif not market_ok:
                 exit_reason = "salida: mercado (QQQ) bajo MA50"
 
-        if exit_reason and "salida:" in exit_reason:
-            # submit SELL for next open (market order)
+        if exit_reason:
             qty = safe_float(positions[0].qty)
             if qty > 0:
                 sell = MarketOrderRequest(
@@ -241,11 +228,11 @@ def main():
                 trading.submit_order(sell)
                 action_lines.append(f"✅ SELL {held_symbol} qty {qty:g} ({exit_reason})")
             else:
-                action_lines.append(f"ℹ️ Tenía posición {held_symbol} pero qty inválida, no vendí.")
+                action_lines.append(f"ℹ️ Tenía {held_symbol} pero qty inválida, no vendí.")
         else:
             action_lines.append(f"ℹ️ Mantengo {held_symbol} (market_ok={market_ok}).")
 
-    # Entry logic (solo si no hay posición)
+    # ---- Entry logic (solo si no hay posición) ----
     if not held_symbol:
         if not market_ok:
             action_lines.append("⛔ No compro: filtro mercado OFF (QQQ < MA50).")
@@ -267,7 +254,6 @@ def main():
                         notional=round(notional, 2),
                         side=OrderSide.BUY,
                         time_in_force=TimeInForce.DAY,
-                        # bracket: Alpaca crea TP/SL asociados
                         order_class="bracket",
                         take_profit={"limit_price": take_price},
                         stop_loss={"stop_price": stop_price},
@@ -285,13 +271,14 @@ def main():
         orders = trading.get_orders(req)
         order_lines = []
         for o in orders[:10]:
-            order_lines.append(f"- {o.side} {o.symbol} {o.qty or o.notional} | {o.status}")
+            amt = o.qty or o.notional
+            order_lines.append(f"- {o.side} {o.symbol} {amt} | {o.status}")
         if not order_lines:
             order_lines = ["- (sin órdenes hoy)"]
     except Exception:
         order_lines = ["- (no pude listar órdenes hoy)"]
 
-    # ---- Build report ----
+    # ---- Report ----
     stamp = f"{now_et:%Y-%m-%d %H:%M} ET"
     report = []
     report.append(f"📌 Quantito Daily ({stamp})")
